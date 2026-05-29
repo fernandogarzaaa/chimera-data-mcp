@@ -1,46 +1,56 @@
 # chimera-data-mcp
 
-## Architecture Layout
+## Architectural Flowchart
 
 ```text
-[LLM Agent (Claude/Desktop)]
-            |
-            v
-   [MCP stdio transport]
-            |
-            v
-[Chimera-Enterprise-Data-Analyst MCP Server]
-   |                |                    |
-   |                |                    |
-   v                v                    v
-[get_schema_layout] [execute_readonly_query] [run_python_analytics]
-   |                |                    |
-   v                v                    v
-SQLAlchemy inspect  Secure SELECT-only    Isolated Python namespace
-(table metadata)    query execution       (pd, np, df pre-injected)
-            \           |                 /
-             \          v                /
-              \   Enterprise Database   /
-               \_______________________/
+Client Agent
+     |
+     v
+FastMCP Server (Chimera-Enterprise-Data-Analyst)
+     |
+     +------------------------+
+     |                        |
+     v                        v
+Secure Database Engine   Execution Sandbox Engine
+(SQLAlchemy + Read-only) (Pandas/Numpy + Isolated exec)
 ```
 
-## Quickstart
+## Setup Instructions
 
-1. `python -m venv venv`
-2. `source venv/bin/activate`
-3. `pip install -r requirements.txt`
-4. `python src/main.py`
+1. Create a virtual environment:
+   ```bash
+   python -m venv venv
+   ```
+2. Activate it:
+   - macOS/Linux:
+     ```bash
+     source venv/bin/activate
+     ```
+   - Windows (PowerShell):
+     ```powershell
+     .\venv\Scripts\Activate.ps1
+     ```
+3. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+4. Launch the MCP server:
+   ```bash
+   python src/main.py
+   ```
 
-## Claude Desktop Integration Config
+## Claude Desktop Integration
 
-Add this entry to your `claude_desktop_config.json`:
+Add this block to your `claude_desktop_config.json` under `mcpServers` to run over `stdio` transport:
 
 ```json
 {
   "mcpServers": {
     "chimera-data-mcp": {
       "command": "python",
-      "args": ["/absolute/path/to/src/main.py"]
+      "args": [
+        "/tmp/workspace/fernandogarzaaa/chimera-data-mcp/src/main.py"
+      ]
     }
   }
 }

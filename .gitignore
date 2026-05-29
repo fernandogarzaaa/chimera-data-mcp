@@ -1,3 +1,7 @@
 __pycache__/
 *.pyc
-retail_supply_chain.db
+.env
+venv/
+.venv
+*.db
+.DS_Store

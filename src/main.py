@@ -1,80 +1,71 @@
-"""MCP server entrypoint for the Chimera Enterprise Data Analyst."""
-
 from __future__ import annotations
 
+import json
 import traceback
 from typing import Any
 
 from dotenv import load_dotenv
-from mcp.server.fastmcp import FastMCP
-from pydantic import BaseModel, Field
+from fastmcp import FastMCP
 
-try:
-    from .database import DatabaseManager
-    from .sandbox import AnalyticsSandbox
-except ImportError:
-    from database import DatabaseManager
-    from sandbox import AnalyticsSandbox
+from database import DatabaseManager
+from sandbox import AnalyticsSandbox
 
 load_dotenv()
 
-server = FastMCP("Chimera-Enterprise-Data-Analyst")
+mcp = FastMCP("Chimera-Enterprise-Data-Analyst")
 database_manager = DatabaseManager()
 analytics_sandbox = AnalyticsSandbox()
 
 
-class QueryRequest(BaseModel):
-    """Validated input for read-only SQL execution."""
-
-    sql_query: str = Field(min_length=1)
-
-
-class PythonAnalyticsRequest(BaseModel):
-    """Validated input for Python analytics execution."""
-
-    python_code: str = Field(min_length=1)
-    data_context: list[dict[str, Any]]
-
-
-@server.tool()
+@mcp.tool()
 def get_schema_layout() -> str:
-    """Call this first to inspect available business schemas without returning data rows."""
+    """
+    Return the complete table-and-column layout for the active database as compact JSON.
+
+    Use this tool first during exploration to understand all available tables, column names,
+    SQL data types, nullability, and primary/foreign key flags before writing queries.
+    """
     try:
         return database_manager.get_schema_layout()
     except Exception:
-        return f"Schema Inspection Error:\n{traceback.format_exc()}"
+        return traceback.format_exc()
 
 
-@server.tool()
-def execute_readonly_query(sql_query: str) -> list[dict[str, Any]] | str:
-    """Execute read-only SQL (`SELECT`/`WITH`) against the active data lake."""
+@mcp.tool()
+def execute_readonly_query(sql_query: str) -> str:
+    """
+    Execute a strictly read-only SQL query and return JSON-encoded results.
+
+    This tool accepts SQL that begins only with SELECT or WITH and blocks any mutation intent.
+    On success, it returns a JSON array of row objects; on failure, it returns a JSON error object.
+    """
     try:
-        validated = QueryRequest(sql_query=sql_query)
-        return database_manager.execute_query(validated.sql_query)
+        result = database_manager.execute_query(sql_query)
+        if isinstance(result, str):
+            return json.dumps({"error": result})
+        return json.dumps(result, default=str)
     except Exception:
-        return f"Query Execution Error:\n{traceback.format_exc()}"
+        return json.dumps({"error": traceback.format_exc()})
 
 
-@server.tool()
+@mcp.tool()
 def run_python_analytics(python_code: str, data_context: list[dict[str, Any]]) -> dict[str, Any]:
-    """Run pandas analytics where `data_context` is auto-injected as DataFrame `df`."""
+    """
+    Run analyst-provided Python code inside a constrained sandbox against query output.
+
+    The input rows are provided to the sandbox as a pandas DataFrame named df,
+    while pandas and numpy are preloaded as pd and np for calculation workflows.
+    """
     try:
-        validated = PythonAnalyticsRequest(
-            python_code=python_code,
-            data_context=data_context,
-        )
-        return analytics_sandbox.execute_analysis(
-            validated.python_code,
-            validated.data_context,
-        )
+        return analytics_sandbox.execute_analysis(python_code, data_context)
     except Exception:
         return {
             "success": False,
             "stdout": "",
-            "stderr": f"Analytics Tool Error:\n{traceback.format_exc()}",
+            "stderr": traceback.format_exc(),
             "local_state": "{}",
         }
 
 
 if __name__ == "__main__":
-    server.run(transport="stdio")
+    mcp.run()
