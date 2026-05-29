@@ -79,6 +79,20 @@ class AnalyticsSandbox:
 
         return tracer
 
+    def _collect_state_changes(
+        self,
+        local_env: dict[str, Any],
+        initial_state: dict[str, str],
+    ) -> dict[str, str]:
+        state_changes: dict[str, str] = {}
+        for key, value in local_env.items():
+            if key.startswith("__"):
+                continue
+            current_repr = repr(value)
+            if key not in initial_state or initial_state[key] != current_repr:
+                state_changes[key] = current_repr
+        return state_changes
+
     def execute_analysis(self, python_code: str, raw_data: list[dict[str, Any]]) -> dict[str, Any]:
         df = pd.DataFrame(raw_data)
         local_env: dict[str, Any] = {"pd": pd, "np": np, "df": df}
@@ -98,13 +112,7 @@ class AnalyticsSandbox:
                 exec(python_code, {"__builtins__": SAFE_BUILTINS}, local_env)
                 sys.settrace(None)
 
-            state_changes: dict[str, str] = {}
-            for key, value in local_env.items():
-                if key.startswith("__"):
-                    continue
-                current_repr = repr(value)
-                if key not in initial_state or initial_state[key] != current_repr:
-                    state_changes[key] = current_repr
+            state_changes = self._collect_state_changes(local_env, initial_state)
 
             return {
                 "success": True,
@@ -114,13 +122,7 @@ class AnalyticsSandbox:
             }
         except Exception:
             stderr_buffer.write(traceback.format_exc())
-            state_changes = {}
-            for key, value in local_env.items():
-                if key.startswith("__"):
-                    continue
-                current_repr = repr(value)
-                if key not in initial_state or initial_state[key] != current_repr:
-                    state_changes[key] = current_repr
+            state_changes = self._collect_state_changes(local_env, initial_state)
 
             return {
                 "success": False,
