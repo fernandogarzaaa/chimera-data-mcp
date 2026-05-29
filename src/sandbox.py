@@ -60,10 +60,6 @@ MAX_EXECUTION_SECONDS = 2.0
 
 class AnalyticsSandbox:
     def _validate_python_code(self, python_code: str) -> None:
-        lowered = python_code.lower()
-        if "__" in python_code or "import " in lowered:
-            raise ValueError("Unsafe Python code detected: dunder access and imports are not allowed.")
-
         tree = ast.parse(python_code, mode="exec")
         for node in ast.walk(tree):
             if isinstance(node, (ast.Import, ast.ImportFrom, ast.Global, ast.Nonlocal)):

@@ -95,7 +95,9 @@ class DatabaseManager:
 
         for table_name in inspector.get_table_names():
             columns = inspector.get_columns(table_name)
-            primary_key_columns = set((inspector.get_pk_constraint(table_name) or {}).get("constrained_columns") or [])
+            pk_constraint = inspector.get_pk_constraint(table_name) or {}
+            constrained_columns = pk_constraint.get("constrained_columns") or []
+            primary_key_columns = set(constrained_columns)
             foreign_key_columns: set[str] = set()
             for fk in inspector.get_foreign_keys(table_name):
                 foreign_key_columns.update(fk.get("constrained_columns") or [])
