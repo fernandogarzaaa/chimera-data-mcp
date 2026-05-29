@@ -28,6 +28,8 @@ READ_ONLY_ERROR = "Security Violation: Only read-only SELECT operations are auth
 _MUTATION_PATTERN = re.compile(
     r"\b(insert|update|delete|drop|alter|truncate|create|replace)\b", re.IGNORECASE
 )
+_LINE_COMMENT_PATTERN = re.compile(r"(--|#).*?($|\n)", re.MULTILINE)
+_BLOCK_COMMENT_PATTERN = re.compile(r"/\*.*?\*/", re.DOTALL)
 
 
 class DatabaseManager:
@@ -245,6 +247,12 @@ class DatabaseManager:
             connection.execute(sales_performance.insert(), sales_rows)
             connection.execute(inventory_status.insert(), inventory_rows)
 
+    def _normalize_for_validation(self, sql_query: str) -> str:
+        """Normalize query text and strip comments before security checks."""
+        no_block_comments = _BLOCK_COMMENT_PATTERN.sub(" ", sql_query)
+        no_line_comments = _LINE_COMMENT_PATTERN.sub(" ", no_block_comments)
+        return " ".join(no_line_comments.lower().strip().split())
+
     def get_schema_layout(self) -> str:
         """Return compact JSON with table/column metadata without scanning table rows."""
         inspector = inspect(self.engine)
@@ -281,7 +289,7 @@ class DatabaseManager:
 
     def execute_query(self, sql_query: str) -> list[dict[str, Any]] | str:
         """Execute a validated read-only SQL query and return rows as dictionaries."""
-        normalized_query = " ".join(sql_query.lower().strip().split())
+        normalized_query = self._normalize_for_validation(sql_query)
         if not normalized_query.startswith(("select", "with")) or _MUTATION_PATTERN.search(
             normalized_query
         ):
@@ -292,4 +300,4 @@ class DatabaseManager:
                 result = connection.execute(text(sql_query))
                 return [dict(row) for row in result.mappings().all()]
         except SQLAlchemyError as exc:
-            return f"Database Error: {exc}"
+            return f"Database Error ({type(exc).__name__}): {exc}"
