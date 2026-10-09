@@ -4,4 +4,4 @@ SQLAlchemy>=2.0.0
 pandas>=2.1.0
 numpy>=2.5.3
 pydantic>=2.5.0
-python-dotenv>=1.0.1
+python-dotenv>=1.2.4
