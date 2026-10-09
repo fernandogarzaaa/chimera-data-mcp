@@ -3,5 +3,5 @@ mcp>=1.2.0
 SQLAlchemy>=2.0.0
 pandas>=3.0.6
 numpy>=2.5.3
-pydantic>=2.5.0
+pydantic>=2.13.5
 python-dotenv>=1.2.4
