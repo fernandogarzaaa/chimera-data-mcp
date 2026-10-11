@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from dotenv import load_dotenv
 from fastmcp import FastMCP
 
 from database import DatabaseManager
+from errors import ClientSafeError
 from sandbox import AnalyticsSandbox
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 mcp = FastMCP("Chimera-Enterprise-Data-Analyst")
 database_manager = DatabaseManager()
@@ -17,9 +21,17 @@ analytics_sandbox = AnalyticsSandbox()
 
 
 def _safe_error(exc: BaseException) -> str:
-    """One-line error for MCP clients: exception type + message, no stack
-    frames (server paths stay server-side)."""
-    return f"{type(exc).__name__}: {exc}"
+    """Client-safe one-line error for MCP clients.
+
+    Deliberate ClientSafeError messages are human-written and pass through.
+    Unexpected exceptions are logged server-side with their full traceback
+    and replaced with a generic message: a raw exception message can embed
+    server filesystem paths just as a stack trace can.
+    """
+    if isinstance(exc, ClientSafeError):
+        return f"{type(exc).__name__}: {exc}"
+    logger.exception("unexpected tool failure")
+    return f"{type(exc).__name__}: an unexpected error occurred"
 
 
 @mcp.tool()
@@ -46,8 +58,6 @@ def execute_readonly_query(sql_query: str) -> str:
     """
     try:
         result = database_manager.execute_query(sql_query)
-        if isinstance(result, str):
-            return json.dumps({"error": result})
         return json.dumps(result, default=str)
     except Exception as exc:
         return json.dumps({"error": _safe_error(exc)})

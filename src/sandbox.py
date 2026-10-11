@@ -5,12 +5,13 @@ import io
 import json
 import sys
 import time
-import traceback
 from contextlib import redirect_stderr, redirect_stdout
 from typing import Any
 
 import numpy as np
 import pandas as pd
+
+from errors import ClientSafeError
 
 
 SAFE_BUILTINS: dict[str, Any] = {
@@ -60,14 +61,15 @@ MAX_EXECUTION_SECONDS = 2.0
 
 class AnalyticsSandbox:
     def _validate_python_code(self, python_code: str) -> None:
+        """Reject unsafe code with a client-safe error (message is human-written)."""
         tree = ast.parse(python_code, mode="exec")
         for node in ast.walk(tree):
             if isinstance(node, (ast.Import, ast.ImportFrom, ast.Global, ast.Nonlocal)):
-                raise ValueError("Unsafe Python code detected: import/global statements are not allowed.")
+                raise ClientSafeError("Unsafe Python code detected: import/global statements are not allowed.")
             if isinstance(node, ast.Attribute) and node.attr.startswith("__"):
-                raise ValueError("Unsafe Python code detected: dunder attribute access is not allowed.")
+                raise ClientSafeError("Unsafe Python code detected: dunder attribute access is not allowed.")
             if isinstance(node, ast.Name) and node.id in DANGEROUS_NAMES:
-                raise ValueError(f"Unsafe Python code detected: use of '{node.id}' is not allowed.")
+                raise ClientSafeError(f"Unsafe Python code detected: use of '{node.id}' is not allowed.")
 
     def _timeout_tracer(self, start_time: float) -> Any:
         def tracer(frame: Any, event: str, arg: Any) -> Any:
@@ -120,8 +122,12 @@ class AnalyticsSandbox:
                 "stderr": stderr_buffer.getvalue(),
                 "local_state": json.dumps(state_changes, default=str),
             }
-        except Exception:
-            stderr_buffer.write(traceback.format_exc())
+        except Exception as exc:
+            # One-line summary only: the full traceback embeds server file
+            # paths (e.g. .../sandbox.py) and must never reach MCP clients.
+            # The message comes from the analyst's own code, so it carries no
+            # server internals; deliberate policy rejections are ClientSafeError.
+            stderr_buffer.write(f"{type(exc).__name__}: {exc}")
             state_changes = self._collect_state_changes(local_env, initial_state)
 
             return {

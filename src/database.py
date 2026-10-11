@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 import os
 import re
-import traceback
 from pathlib import Path
 from typing import Any
 
 from sqlalchemy import Column, Float, Integer, MetaData, String, Table, create_engine, inspect, text
+
+from errors import ClientSafeError
 
 
 DEFAULT_DATABASE_URL = "sqlite:///./retail_supply_chain.db"
@@ -117,18 +118,17 @@ class DatabaseManager:
 
         return json.dumps(schema_map, separators=(",", ":"))
 
-    def execute_query(self, sql_query: str) -> list[dict[str, Any]] | str:
+    def execute_query(self, sql_query: str) -> list[dict[str, Any]]:
         cleaned_query = COMMENT_PATTERN.sub(" ", sql_query).strip()
 
         if not ENTRYPOINT_PATTERN.match(cleaned_query):
-            raise ValueError(SECURITY_VIOLATION_MESSAGE)
+            raise ClientSafeError(SECURITY_VIOLATION_MESSAGE)
 
         if MUTATION_PATTERN.search(cleaned_query):
-            raise ValueError(SECURITY_VIOLATION_MESSAGE)
+            raise ClientSafeError(SECURITY_VIOLATION_MESSAGE)
 
-        try:
-            with self.engine.connect() as connection:
-                result = connection.execute(text(cleaned_query))
-                return [dict(row) for row in result.mappings().all()]
-        except Exception:
-            return traceback.format_exc()
+        # Execution errors propagate to the tool wrapper, which formats them
+        # via _safe_error: no tracebacks (and no server paths) reach clients.
+        with self.engine.connect() as connection:
+            result = connection.execute(text(cleaned_query))
+            return [dict(row) for row in result.mappings().all()]
