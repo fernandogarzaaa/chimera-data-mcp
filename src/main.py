@@ -1,20 +1,37 @@
 from __future__ import annotations
 
 import json
-import traceback
+import logging
 from typing import Any
 
 from dotenv import load_dotenv
 from fastmcp import FastMCP
 
 from database import DatabaseManager
+from errors import ClientSafeError
 from sandbox import AnalyticsSandbox
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
 mcp = FastMCP("Chimera-Enterprise-Data-Analyst")
 database_manager = DatabaseManager()
 analytics_sandbox = AnalyticsSandbox()
+
+
+def _safe_error(exc: BaseException) -> str:
+    """Client-safe one-line error for MCP clients.
+
+    Deliberate ClientSafeError messages are human-written and pass through.
+    Unexpected exceptions are logged server-side with their full traceback
+    and replaced with a generic message: a raw exception message can embed
+    server filesystem paths just as a stack trace can.
+    """
+    if isinstance(exc, ClientSafeError):
+        return f"{type(exc).__name__}: {exc}"
+    logger.exception("unexpected tool failure")
+    return f"{type(exc).__name__}: an unexpected error occurred"
 
 
 @mcp.tool()
@@ -27,8 +44,8 @@ def get_schema_layout() -> str:
     """
     try:
         return database_manager.get_schema_layout()
-    except Exception:
-        return traceback.format_exc()
+    except Exception as exc:
+        return _safe_error(exc)
 
 
 @mcp.tool()
@@ -41,11 +58,9 @@ def execute_readonly_query(sql_query: str) -> str:
     """
     try:
         result = database_manager.execute_query(sql_query)
-        if isinstance(result, str):
-            return json.dumps({"error": result})
         return json.dumps(result, default=str)
-    except Exception:
-        return json.dumps({"error": traceback.format_exc()})
+    except Exception as exc:
+        return json.dumps({"error": _safe_error(exc)})
 
 
 @mcp.tool()
@@ -58,11 +73,11 @@ def run_python_analytics(python_code: str, data_context: list[dict[str, Any]]) -
     """
     try:
         return analytics_sandbox.execute_analysis(python_code, data_context)
-    except Exception:
+    except Exception as exc:
         return {
             "success": False,
             "stdout": "",
-            "stderr": traceback.format_exc(),
+            "stderr": _safe_error(exc),
             "local_state": "{}",
         }
 
