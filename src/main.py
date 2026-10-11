@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import traceback
 from typing import Any
 
 from dotenv import load_dotenv
@@ -17,6 +16,12 @@ database_manager = DatabaseManager()
 analytics_sandbox = AnalyticsSandbox()
 
 
+def _safe_error(exc: BaseException) -> str:
+    """One-line error for MCP clients: exception type + message, no stack
+    frames (server paths stay server-side)."""
+    return f"{type(exc).__name__}: {exc}"
+
+
 @mcp.tool()
 def get_schema_layout() -> str:
     """
@@ -27,8 +32,8 @@ def get_schema_layout() -> str:
     """
     try:
         return database_manager.get_schema_layout()
-    except Exception:
-        return traceback.format_exc()
+    except Exception as exc:
+        return _safe_error(exc)
 
 
 @mcp.tool()
@@ -44,8 +49,8 @@ def execute_readonly_query(sql_query: str) -> str:
         if isinstance(result, str):
             return json.dumps({"error": result})
         return json.dumps(result, default=str)
-    except Exception:
-        return json.dumps({"error": traceback.format_exc()})
+    except Exception as exc:
+        return json.dumps({"error": _safe_error(exc)})
 
 
 @mcp.tool()
@@ -58,11 +63,11 @@ def run_python_analytics(python_code: str, data_context: list[dict[str, Any]]) -
     """
     try:
         return analytics_sandbox.execute_analysis(python_code, data_context)
-    except Exception:
+    except Exception as exc:
         return {
             "success": False,
             "stdout": "",
-            "stderr": traceback.format_exc(),
+            "stderr": _safe_error(exc),
             "local_state": "{}",
         }
 

@@ -57,3 +57,37 @@ def test_server_module_imports(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     main = importlib.import_module("main")
     assert main.mcp is not None
+
+
+def test_tool_errors_do_not_leak_tracebacks(tmp_path, monkeypatch):
+    """Unexpected tool failures return a one-line error, never a stack trace
+    with server filesystem paths."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    main = importlib.import_module("main")
+
+    def _run():
+        # force an unexpected failure inside each tool
+        monkeypatch.setattr(
+            main.database_manager, "get_schema_layout",
+            lambda: (_ for _ in ()).throw(RuntimeError("boom-schema")),
+        )
+        out = main.get_schema_layout()
+        assert "boom-schema" in out and "Traceback" not in out and "/home/" not in out
+
+        monkeypatch.setattr(
+            main.database_manager, "execute_query",
+            lambda q: (_ for _ in ()).throw(RuntimeError("boom-query")),
+        )
+        err = json.loads(main.execute_readonly_query("SELECT 1"))
+        assert "boom-query" in err["error"] and "Traceback" not in err["error"]
+
+        monkeypatch.setattr(
+            main.analytics_sandbox, "execute_analysis",
+            lambda code, ctx: (_ for _ in ()).throw(RuntimeError("boom-sandbox")),
+        )
+        res = main.run_python_analytics("1+1", [])
+        assert res["success"] is False
+        assert "boom-sandbox" in res["stderr"] and "Traceback" not in res["stderr"]
+
+    _run()
