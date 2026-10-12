@@ -396,3 +396,140 @@ def test_postgres_engine_registers_read_only_session(monkeypatch):
     engine.dispatch.connect(Conn(), None)
     assert executed[0] == "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY"
     assert executed[1].startswith("SET statement_timeout = ")
+
+
+# ------------------------------------------------ hardening the verifier itself
+
+
+def test_unsafe_code_is_rejected_in_parent_without_spawning(monkeypatch, sandbox):
+    import sandbox as sandbox_module
+
+    def must_not_run(*a, **k):
+        raise AssertionError("worker must not start for code rejected by policy")
+
+    monkeypatch.setattr(sandbox_module.subprocess, "run", must_not_run)
+    result = sandbox.execute_analysis("df.to_csv('x')", ROWS)
+    assert result == {
+        "success": False,
+        "stdout": "",
+        "stderr": "ClientSafeError: Unsafe Python code detected: attribute 'to_csv' is not allowed "
+        "(file/network IO, serialisation and interpreter internals are disabled).",
+        "local_state": "{}",
+    }
+
+
+def test_validate_raises_client_safe_error(sandbox):
+    from errors import ClientSafeError
+
+    with pytest.raises(ClientSafeError):
+        sandbox._validate_python_code("x = df.to_pickle")
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "expected"),
+    [
+        (0, "", "SandboxError: sandbox process exited without a result."),
+        (0, '{"stdout": "x"}', "SandboxError: malformed sandbox result."),
+        (0, "x" * 2_000_000, "SandboxError: sandbox process exited without a result."),
+    ],
+)
+def test_worker_protocol_errors(monkeypatch, sandbox, returncode, stdout, expected):
+    import sandbox as sandbox_module
+
+    monkeypatch.setattr(
+        sandbox_module.subprocess,
+        "run",
+        lambda *a, **k: subprocess.CompletedProcess(a, returncode, stdout=stdout, stderr=""),
+    )
+    assert sandbox.execute_analysis("x = 1", ROWS)["stderr"] == expected
+
+
+def test_worker_result_fields_are_normalised(monkeypatch, sandbox):
+    import sandbox as sandbox_module
+
+    payload = json.dumps({"success": 1, "stdout": 5, "stderr": None, "local_state": {"a": 1}})
+    monkeypatch.setattr(
+        sandbox_module.subprocess,
+        "run",
+        lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout=payload, stderr=""),
+    )
+    assert sandbox.execute_analysis("x = 1", ROWS) == {
+        "success": True,
+        "stdout": "5",
+        "stderr": "None",
+        "local_state": "{'a': 1}",
+    }
+
+
+def test_worker_invocation_is_isolated(monkeypatch, sandbox):
+    import sandbox as sandbox_module
+
+    seen = {}
+
+    def spy(argv, **kwargs):
+        seen["argv"] = argv
+        seen.update(kwargs)
+        return subprocess.CompletedProcess(argv, 0, stdout='{"success": true}', stderr="")
+
+    monkeypatch.setattr(sandbox_module.subprocess, "run", spy)
+    sandbox.execute_analysis("x = 1", ROWS)
+    assert seen["argv"] == [sys.executable, "-I", str(WORKER)]
+    assert seen["check"] is False and seen["capture_output"] is True
+    assert seen["timeout"] == sandbox_module.MAX_EXECUTION_SECONDS + sandbox_module.STARTUP_ALLOWANCE_SECONDS
+    request = json.loads(seen["input"])
+    assert request == {
+        "code": "x = 1",
+        "raw_data": ROWS,
+        "timeout": sandbox_module.MAX_EXECUTION_SECONDS,
+        "memory_mb": sandbox_module.MAX_MEMORY_MB,
+    }
+
+
+def test_default_database_contents(db):
+    schema = json.loads(db.get_schema_layout())
+    for table in ("sales_performance", "inventory_status"):
+        cols = schema[table]
+        assert all(c["nullable"] is False for c in cols[1:]), cols
+        assert [c["column_name"] for c in cols if c["primary_key"]] == [cols[0]["column_name"]]
+    assert [c["data_type"] for c in schema["sales_performance"]] == [
+        "INTEGER", "VARCHAR(32)", "VARCHAR(32)", "VARCHAR(64)", "FLOAT", "INTEGER"
+    ]
+    assert [c["data_type"] for c in schema["inventory_status"]] == [
+        "INTEGER", "VARCHAR(64)", "VARCHAR(64)", "INTEGER", "INTEGER", "INTEGER"
+    ]
+    sales = db.execute_query("SELECT * FROM sales_performance ORDER BY transaction_id")
+    inv = db.execute_query("SELECT * FROM inventory_status ORDER BY item_id")
+    assert len(sales) == 10 and len(inv) == 10
+    assert round(sum(r["revenue"] for r in sales), 2) == 99553.49
+    assert sum(r["units_sold"] for r in sales) == 1097
+    assert sales[0] == {"transaction_id": 1, "date": "2026-01-03", "store_id": "NYC-01",
+                        "product_category": "Electronics", "revenue": 18250.75, "units_sold": 42}
+    assert sum(r["stock_on_hand"] for r in inv) == 3840
+    assert sum(r["reorder_point"] for r in inv) == 2210
+    assert sum(r["lead_time_days"] for r in inv) == 103
+    assert [r["sku"] for r in inv][:2] == ["ELEC-1001", "GROC-2045"]
+    assert {r["warehouse_location"] for r in inv} == {"WH-NORTH", "WH-SOUTH", "WH-WEST", "WH-EAST", "WH-CENTRAL"}
+
+
+def test_query_from_another_thread(db):
+    import threading
+
+    out = []
+    t = threading.Thread(target=lambda: out.append(db.execute_query("SELECT 1 AS one")))
+    t.start()
+    t.join(10)
+    assert out == [[{"one": 1}]]
+
+
+def test_sqlite_authorizer_decisions():
+    import sqlite3
+
+    from database import _sqlite_authorizer
+
+    assert _sqlite_authorizer(sqlite3.SQLITE_SELECT, None, None, None, None) == sqlite3.SQLITE_OK
+    assert _sqlite_authorizer(sqlite3.SQLITE_READ, "t", "c", "main", None) == sqlite3.SQLITE_OK
+    assert _sqlite_authorizer(sqlite3.SQLITE_PRAGMA, "table_xinfo", "t", "main", None) == sqlite3.SQLITE_OK
+    assert _sqlite_authorizer(sqlite3.SQLITE_PRAGMA, "read_uncommitted", None, None, None) == sqlite3.SQLITE_OK
+    assert _sqlite_authorizer(sqlite3.SQLITE_PRAGMA, "query_only", "0", None, None) == sqlite3.SQLITE_DENY
+    assert _sqlite_authorizer(sqlite3.SQLITE_INSERT, "t", None, "main", None) == sqlite3.SQLITE_DENY
+    assert _sqlite_authorizer(sqlite3.SQLITE_ATTACH, "x.db", None, None, None) == sqlite3.SQLITE_DENY
