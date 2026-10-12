@@ -3,10 +3,24 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import Column, Float, Integer, MetaData, String, Table, create_engine, inspect, text
+from sqlalchemy import (
+    Column,
+    Engine,
+    Float,
+    Integer,
+    MetaData,
+    String,
+    Table,
+    create_engine,
+    event,
+    inspect,
+    text,
+)
+from sqlalchemy.engine import make_url
 
 from errors import ClientSafeError
 
@@ -19,22 +33,117 @@ MUTATION_PATTERN = re.compile(
     re.IGNORECASE,
 )
 ENTRYPOINT_PATTERN = re.compile(r"^(SELECT|WITH)\b", re.IGNORECASE)
+DEFAULT_MAX_ROWS = 1000
+STATEMENT_TIMEOUT_MS = 10_000
+
+# SQLite authorizer: only reading is allowed on the query connection.
+_SQLITE_ALLOWED_ACTIONS = {
+    sqlite3.SQLITE_SELECT,
+    sqlite3.SQLITE_READ,
+    sqlite3.SQLITE_FUNCTION,
+    getattr(sqlite3, "SQLITE_RECURSIVE", 33),
+}
+
+
+_SQLITE_INTROSPECTION_PRAGMAS = {
+    "table_info",
+    "table_xinfo",
+    "table_list",
+    "index_list",
+    "index_info",
+    "index_xinfo",
+    "foreign_key_list",
+    "database_list",
+}
+
+
+def _sqlite_authorizer(action: int, arg1: Any, arg2: Any, dbname: Any, source: Any) -> int:
+    if action in _SQLITE_ALLOWED_ACTIONS:
+        return sqlite3.SQLITE_OK
+    # PRAGMAs may only be read (``PRAGMA name``, used by SQLAlchemy on connect)
+    # or be schema-introspection calls such as ``PRAGMA table_xinfo(t)``.
+    # Setting any PRAGMA (query_only = OFF, writable_schema = 1, ...) is denied.
+    if action == sqlite3.SQLITE_PRAGMA and (
+        arg2 is None or str(arg1).lower() in _SQLITE_INTROSPECTION_PRAGMAS
+    ):
+        return sqlite3.SQLITE_OK
+    return sqlite3.SQLITE_DENY
+
+
+def _max_rows() -> int:
+    try:
+        return max(1, int(os.getenv("MAX_QUERY_ROWS", str(DEFAULT_MAX_ROWS))))
+    except ValueError:
+        return DEFAULT_MAX_ROWS
+
+
+def _readonly_engine(database_url: str) -> Engine:
+    """Engine whose connections cannot modify data.
+
+    * SQLite file DBs are opened with ``mode=ro`` + ``PRAGMA query_only`` and
+      an authorizer that only permits SELECT/READ/FUNCTION.
+    * PostgreSQL / MySQL sessions are switched to READ ONLY transactions with
+      a statement timeout on connect.
+    * Other backends fall back to the SQL keyword filter only (documented in
+      the README); point DATABASE_URL at a read-only database user there.
+    """
+    url = make_url(database_url)
+    backend = url.get_backend_name()
+    if backend == "sqlite":
+        database = url.database or ""
+        if database in ("", ":memory:"):
+            raise ValueError("an in-memory SQLite database cannot be opened read-only")
+        path = Path(database).resolve()
+        uri = f"file:{path.as_posix()}?mode=ro"
+
+        def _connect() -> sqlite3.Connection:
+            conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+            conn.execute("PRAGMA query_only = ON")
+            conn.set_authorizer(_sqlite_authorizer)
+            return conn
+
+        return create_engine("sqlite://", creator=_connect, future=True)
+
+    engine = create_engine(database_url, future=True)
+    if backend == "postgresql":
+
+        @event.listens_for(engine, "connect")
+        def _pg_readonly(dbapi_conn: Any, _record: Any) -> None:
+            cur = dbapi_conn.cursor()
+            cur.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
+            cur.execute(f"SET statement_timeout = {STATEMENT_TIMEOUT_MS}")
+            cur.close()
+
+    elif backend in ("mysql", "mariadb"):
+
+        @event.listens_for(engine, "connect")
+        def _mysql_readonly(dbapi_conn: Any, _record: Any) -> None:
+            cur = dbapi_conn.cursor()
+            cur.execute("SET SESSION TRANSACTION READ ONLY")
+            cur.execute(f"SET SESSION MAX_EXECUTION_TIME = {STATEMENT_TIMEOUT_MS}")
+            cur.close()
+
+    return engine
 
 
 class DatabaseManager:
     def __init__(self) -> None:
         configured_url = os.getenv("DATABASE_URL", "").strip()
         self.database_url = configured_url or DEFAULT_DATABASE_URL
-        self.engine = create_engine(self.database_url, future=True)
+        self.max_rows = _max_rows()
 
         if self.database_url == DEFAULT_DATABASE_URL:
             sqlite_path = Path("./retail_supply_chain.db")
             if not sqlite_path.exists():
                 self._bootstrap_default_database(sqlite_path)
 
+        # All queries (and schema inspection) go through a read-only engine.
+        self.engine = _readonly_engine(self.database_url)
+
     def _bootstrap_default_database(self, sqlite_path: Path) -> None:
         sqlite_path.parent.mkdir(parents=True, exist_ok=True)
         metadata = MetaData()
+        writer = create_engine(self.database_url, future=True)
 
         sales_performance = Table(
             "sales_performance",
@@ -58,7 +167,7 @@ class DatabaseManager:
             Column("lead_time_days", Integer, nullable=False),
         )
 
-        metadata.create_all(self.engine)
+        metadata.create_all(writer)
 
         sales_rows: list[dict[str, Any]] = [
             {"transaction_id": 1, "date": "2026-01-03", "store_id": "NYC-01", "product_category": "Electronics", "revenue": 18250.75, "units_sold": 42},
@@ -86,9 +195,10 @@ class DatabaseManager:
             {"item_id": 10, "sku": "AUTO-9322", "warehouse_location": "WH-CENTRAL", "stock_on_hand": 160, "reorder_point": 120, "lead_time_days": 16},
         ]
 
-        with self.engine.begin() as connection:
+        with writer.begin() as connection:
             connection.execute(sales_performance.insert(), sales_rows)
             connection.execute(inventory_status.insert(), inventory_rows)
+        writer.dispose()
 
     def get_schema_layout(self) -> str:
         inspector = inspect(self.engine)
@@ -129,6 +239,12 @@ class DatabaseManager:
 
         # Execution errors propagate to the tool wrapper, which formats them
         # via _safe_error: no tracebacks (and no server paths) reach clients.
+        # The connection itself is read-only (see _readonly_engine); the
+        # keyword filter above is only a first, friendly line of defence.
+        # Results are capped at max_rows to bound memory use.
         with self.engine.connect() as connection:
             result = connection.execute(text(cleaned_query))
-            return [dict(row) for row in result.mappings().all()]
+            rows = result.mappings().fetchmany(self.max_rows)
+            result.close()
+            connection.rollback()
+            return [dict(row) for row in rows]
