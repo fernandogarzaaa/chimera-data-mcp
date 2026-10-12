@@ -124,6 +124,46 @@ def test_string_dispatched_io_is_blocked_at_runtime(sandbox, tmp_path, code):
     assert not target.exists()
 
 
+def test_audit_hook_is_active_in_worker(sandbox, tmp_path):
+    # String dispatch reaches DataFrame.to_pickle -> open(); the audit hook
+    # must refuse it (PermissionError) before the fd limit (OSError) is hit.
+    target = tmp_path / "p.pkl"
+    result = sandbox.execute_analysis(f"df.apply('to_pickle', path={str(target)!r})", ROWS)
+    assert result["stderr"].startswith("PermissionError: sandbox: operation 'open'"), result["stderr"]
+    assert not target.exists()
+
+
+def test_worker_enforces_policy_on_its_own():
+    # The worker must not rely on the parent having validated the code.
+    req = json.dumps({"code": "df.to_csv('x.csv')", "raw_data": ROWS})
+    proc = subprocess.run([sys.executable, "-I", str(WORKER)], input=req, capture_output=True,
+                          text=True, timeout=120, check=False)
+    out = json.loads(proc.stdout)
+    assert out["success"] is False
+    assert out["stderr"].startswith("ClientSafeError: Unsafe Python code detected: attribute 'to_csv'")
+    assert proc.returncode == 0
+
+
+def test_audit_hook_is_active_in_worker(sandbox, tmp_path):
+    # String dispatch reaches DataFrame.to_pickle -> open(); the audit hook
+    # must refuse it (PermissionError) before the fd limit (OSError) is hit.
+    target = tmp_path / "p.pkl"
+    result = sandbox.execute_analysis(f"df.apply('to_pickle', path={str(target)!r})", ROWS)
+    assert result["stderr"].startswith("PermissionError: sandbox: operation 'open'"), result["stderr"]
+    assert not target.exists()
+
+
+def test_worker_enforces_policy_on_its_own():
+    # The worker must not rely on the parent having validated the code.
+    req = json.dumps({"code": "df.to_csv('x.csv')", "raw_data": ROWS})
+    proc = subprocess.run([sys.executable, "-I", str(WORKER)], input=req, capture_output=True,
+                          text=True, timeout=120, check=False)
+    out = json.loads(proc.stdout)
+    assert out["success"] is False
+    assert out["stderr"].startswith("ClientSafeError: Unsafe Python code detected: attribute 'to_csv'")
+    assert proc.returncode == 0
+
+
 def test_frame_introspection_is_rejected(sandbox):
     code = "def g():\n    yield 1\nit = g()\nf = it.gi_frame"
     result = sandbox.execute_analysis(code, ROWS)
@@ -162,12 +202,13 @@ def test_worker_environment_has_no_secrets(sandbox, monkeypatch):
 def test_cpu_bound_code_times_out(sandbox):
     result = sandbox.execute_analysis("x = 0\nwhile True:\n    x += 1", ROWS)
     assert result["success"] is False
-    assert "Timeout" in result["stderr"] or "ResourceLimit" in result["stderr"]
+    assert result["stderr"].startswith("TimeoutError"), result["stderr"]
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="RLIMIT_AS is enforced on Linux")
 def test_huge_allocation_hits_memory_limit(sandbox):
-    result = sandbox.execute_analysis("a = np.ones(10**10)", ROWS)
+    # ~800 MB: fits on a normal host/CI runner, but not in the 512 MB budget.
+    result = sandbox.execute_analysis("a = np.ones(10**8)", ROWS)
     assert result["success"] is False
     assert "Memory" in result["stderr"] or "ResourceLimit" in result["stderr"]
 
@@ -313,6 +354,22 @@ def test_connection_itself_is_read_only(db, statement, tmp_path):
         raw.close()
     assert db.execute_query("SELECT COUNT(*) AS n FROM sales_performance") == [{"n": 10}]
     assert not (tmp_path / "pwn.db").exists()
+
+
+@pytest.mark.parametrize("statement", ["PRAGMA table_info(sales_performance)", "VACUUM", "EXPLAIN SELECT 1"])
+def test_non_select_entrypoints_are_refused(db, statement):
+    from errors import ClientSafeError
+
+    with pytest.raises(ClientSafeError, match="Security Violation"):
+        db.execute_query(statement)
+
+
+@pytest.mark.parametrize("statement", ["PRAGMA table_info(sales_performance)", "VACUUM", "EXPLAIN SELECT 1"])
+def test_non_select_entrypoints_are_refused(db, statement):
+    from errors import ClientSafeError
+
+    with pytest.raises(ClientSafeError, match="Security Violation"):
+        db.execute_query(statement)
 
 
 def test_cte_write_is_blocked(db):
