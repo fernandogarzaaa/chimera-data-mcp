@@ -331,13 +331,15 @@ def main() -> int:
         sys.addaudithook(_audit_hook)
         _apply_resource_limits(cpu_seconds=max(1, int(timeout + 0.999)), memory_mb=memory_mb)
         if hasattr(signal, "setitimer"):
-            signal.signal(signal.SIGALRM, _timeout_handler)
-            signal.setitimer(signal.ITIMER_REAL, timeout)
+            # CPU-time budget (not wall clock), so a loaded host does not
+            # fail legitimate analyses; the parent enforces wall-clock time.
+            signal.signal(signal.SIGPROF, _timeout_handler)
+            signal.setitimer(signal.ITIMER_PROF, timeout)
         _LOCKED = True
         with redirect_stdout(stdout_buffer), redirect_stderr(stderr_buffer):
             exec(compiled, {"__builtins__": SAFE_BUILTINS}, local_env)  # noqa: S102 - sandboxed
         if hasattr(signal, "setitimer"):
-            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.setitimer(signal.ITIMER_PROF, 0)
         success = True
     except SandboxViolation as exc:
         stderr_buffer.write(f"ClientSafeError: {exc}")
@@ -345,7 +347,7 @@ def main() -> int:
         stderr_buffer.write("MemoryError: sandbox memory limit exceeded")
     except BaseException as exc:  # noqa: BLE001 - report analyst errors as one line
         if hasattr(signal, "setitimer"):
-            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.setitimer(signal.ITIMER_PROF, 0)
         stderr_buffer.write(f"{type(exc).__name__}: {exc}")
 
     try:

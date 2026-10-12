@@ -25,6 +25,7 @@ from errors import ClientSafeError
 
 _WORKER = Path(__file__).resolve().with_name("sandbox_worker.py")
 
+# CPU-seconds budget for analyst code (enforced inside the worker).
 MAX_EXECUTION_SECONDS = float(os.getenv("SANDBOX_TIMEOUT_SECONDS", "2.0"))
 MAX_MEMORY_MB = int(os.getenv("SANDBOX_MAX_MEMORY_MB", "512"))
 # Worker start-up (interpreter + pandas import) is not charged to the analyst.
