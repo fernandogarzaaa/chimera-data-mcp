@@ -646,3 +646,16 @@ def test_scan_sql_outputs():
     )
     assert _scan_sql("SELECT 'open DELETE") == ("SELECT 'open DELETE", "SELECT 'open DELETE")
     assert _scan_sql("SELECT 1 /* never closed DELETE") == ("SELECT 1", "SELECT 1")
+
+
+def test_scan_sql_edge_cases():
+    from database import _scan_sql
+
+    assert _scan_sql("/**/SELECT 1") == ("SELECT 1", "SELECT 1")
+    assert _scan_sql("SELECT '', 'x'") == ("SELECT '', 'x'", "SELECT '', ''")
+    assert _scan_sql("SELECT 'a''' AS s") == ("SELECT 'a''' AS s", "SELECT '' AS s")
+    assert _scan_sql('SELECT "" AS e') == ('SELECT "" AS e', 'SELECT "" AS e')
+
+
+def test_empty_and_trailing_escaped_literals_execute(db):
+    assert db.execute_query("SELECT '' AS e, 'a''' AS s") == [{"e": "", "s": "a'"}]
