@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-13
+
+First tagged release.
+
+### Fixed
+- `execute_readonly_query` no longer rejects valid SELECTs whose string values
+  or quoted identifiers contain a write keyword (`WHERE action = 'Update'`,
+  `LIKE '%delete%'`, `SELECT 1 AS "update"`). The keyword filter now runs on a
+  quote- and comment-aware scan of the query.
+- Literals containing `--` or `/*` (`WHERE note = 'a -- b'`) are no longer
+  truncated by comment stripping before the query reaches the database.
+- Write statements outside quotes are still refused, and the connection stays
+  read-only.
+
 ### Security
 - `run_python_analytics` now runs analyst code in a resource-limited child
   process with no file descriptors, an audit hook and allow-listed pandas/numpy

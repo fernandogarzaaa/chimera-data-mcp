@@ -364,14 +364,6 @@ def test_non_select_entrypoints_are_refused(db, statement):
         db.execute_query(statement)
 
 
-@pytest.mark.parametrize("statement", ["PRAGMA table_info(sales_performance)", "VACUUM", "EXPLAIN SELECT 1"])
-def test_non_select_entrypoints_are_refused(db, statement):
-    from errors import ClientSafeError
-
-    with pytest.raises(ClientSafeError, match="Security Violation"):
-        db.execute_query(statement)
-
-
 def test_cte_write_is_blocked(db):
     # A WITH ... statement passes the entrypoint check; the keyword filter or
     # the read-only connection must still stop the write.
@@ -590,3 +582,80 @@ def test_sqlite_authorizer_decisions():
     assert _sqlite_authorizer(sqlite3.SQLITE_PRAGMA, "query_only", "0", None, None) == sqlite3.SQLITE_DENY
     assert _sqlite_authorizer(sqlite3.SQLITE_INSERT, "t", None, "main", None) == sqlite3.SQLITE_DENY
     assert _sqlite_authorizer(sqlite3.SQLITE_ATTACH, "x.db", None, None, None) == sqlite3.SQLITE_DENY
+
+
+# --- quote/comment-aware keyword filter (Oct 2026) -----------------------------
+
+
+@pytest.mark.parametrize(
+    ("sql", "expected"),
+    [
+        ("SELECT COUNT(*) AS n FROM sales_performance WHERE product_category = 'Update'", [{"n": 0}]),
+        ("select count(*) n from inventory_status where sku like '%delete%'", [{"n": 0}]),
+        ("SELECT 'DROP TABLE x' AS s", [{"s": "DROP TABLE x"}]),
+        ('SELECT 1 AS "update"', [{"update": 1}]),
+        ("SELECT 'it''s INSERT' AS s", [{"s": "it's INSERT"}]),
+    ],
+)
+def test_keywords_inside_quotes_are_not_mutations(db, sql, expected):
+    assert db.execute_query(sql) == expected
+
+
+@pytest.mark.parametrize(
+    ("sql", "expected"),
+    [
+        ("SELECT 'a -- b' AS s", [{"s": "a -- b"}]),
+        ("SELECT 'x /* y */ z' AS s", [{"s": "x /* y */ z"}]),
+        ("SELECT 'keep' AS s -- trailing comment", [{"s": "keep"}]),
+        ("/* lead */ SELECT 2 AS n /* mid */", [{"n": 2}]),
+    ],
+)
+def test_comment_markers_inside_literals_are_preserved(db, sql, expected):
+    # Before: the comment regex ran over literals, so 'a -- b' reached the DB
+    # as 'a and the query failed (or returned the wrong rows).
+    assert db.execute_query(sql) == expected
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT 'x'; DELETE FROM sales_performance",
+        "SELECT 'x' /* hide */; DROP TABLE sales_performance",
+        "SELECT 'unterminated; DELETE FROM sales_performance",
+        "SELECT 'a''b'; UPDATE inventory_status SET stock_on_hand = 0",
+        "SELECT 1 -- comment\n; INSERT INTO sales_performance SELECT * FROM sales_performance",
+        "'SELECT' DELETE FROM sales_performance",
+        "/* SELECT */ DELETE FROM sales_performance",
+    ],
+)
+def test_mutations_outside_quotes_still_blocked(db, sql):
+    from errors import ClientSafeError
+
+    with pytest.raises(ClientSafeError, match="Security Violation"):
+        db.execute_query(sql)
+    assert db.execute_query("SELECT COUNT(*) AS n FROM sales_performance") == [{"n": 10}]
+
+
+def test_scan_sql_outputs():
+    from database import _scan_sql
+
+    assert _scan_sql("SELECT 'a--b' -- c\nFROM t") == ("SELECT 'a--b'  \nFROM t", "SELECT ''  \nFROM t")
+    assert _scan_sql('SELECT "DROP" /* x */ , \'it\'\'s\'') == (
+        'SELECT "DROP"   , \'it\'\'s\'',
+        'SELECT ""   , \'\'',
+    )
+    assert _scan_sql("SELECT 'open DELETE") == ("SELECT 'open DELETE", "SELECT 'open DELETE")
+    assert _scan_sql("SELECT 1 /* never closed DELETE") == ("SELECT 1", "SELECT 1")
+
+
+def test_scan_sql_edge_cases():
+    from database import _scan_sql
+
+    assert _scan_sql("/**/SELECT 1") == ("SELECT 1", "SELECT 1")
+    assert _scan_sql("SELECT '', 'x'") == ("SELECT '', 'x'", "SELECT '', ''")
+    assert _scan_sql("SELECT 'a''' AS s") == ("SELECT 'a''' AS s", "SELECT '' AS s")
+    assert _scan_sql('SELECT "" AS e') == ('SELECT "" AS e', 'SELECT "" AS e')
+
+
+def test_empty_and_trailing_escaped_literals_execute(db):
+    assert db.execute_query("SELECT '' AS e, 'a''' AS s") == [{"e": "", "s": "a'"}]

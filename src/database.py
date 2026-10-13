@@ -27,7 +27,6 @@ from errors import ClientSafeError
 
 DEFAULT_DATABASE_URL = "sqlite:///./retail_supply_chain.db"
 SECURITY_VIOLATION_MESSAGE = "Security Violation: Unauthorized data mutation attempt detected. Only read-only SELECT operations are authorized."
-COMMENT_PATTERN = re.compile(r"(--[^\n]*$)|(/\*.*?\*/)", re.MULTILINE | re.DOTALL)
 MUTATION_PATTERN = re.compile(
     r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|GRANT)\b",
     re.IGNORECASE,
@@ -68,6 +67,60 @@ def _sqlite_authorizer(action: int, arg1: Any, arg2: Any, dbname: Any, source: A
     ):
         return sqlite3.SQLITE_OK
     return sqlite3.SQLITE_DENY
+
+
+def _scan_sql(sql: str) -> tuple[str, str]:
+    """Lex ``sql`` once, aware of quotes and comments.
+
+    Returns ``(executable, check_text)``:
+
+    * ``executable`` is the query with ``--`` / ``/* */`` comments replaced by
+      a space and every quoted literal / identifier kept verbatim, so a value
+      such as ``'a -- b'`` is no longer truncated before it reaches the DB.
+    * ``check_text`` is the same text with the *contents* of each quoted span
+      blanked out, for the keyword filters, so ``WHERE status = 'UPDATE'`` is
+      not mistaken for a mutation.
+
+    Quotes follow standard SQL (``'it''s'``, ``"col"``). An unterminated quote
+    leaves the remainder unmasked (and the DB rejects the query anyway), so
+    the filter never sees less than it would without masking.
+    """
+    executable: list[str] = []
+    check: list[str] = []
+    i, n = 0, len(sql)
+    while i < n:
+        ch = sql[i]
+        if sql.startswith("--", i):
+            end = sql.find("\n", i)
+            i = n if end == -1 else end
+            executable.append(" ")
+            check.append(" ")
+            continue
+        if sql.startswith("/*", i):
+            end = sql.find("*/", i + 2)
+            i = n if end == -1 else end + 2
+            executable.append(" ")
+            check.append(" ")
+            continue
+        if ch in ("'", '"'):
+            j = i + 1
+            while True:
+                j = sql.find(ch, j)
+                if j == -1 or not sql.startswith(ch, j + 1):
+                    break
+                j += 2  # doubled quote is an escaped quote
+            if j == -1:  # unterminated: keep the rest visible to the filter
+                executable.append(sql[i:])
+                check.append(sql[i:])
+                break
+            executable.append(sql[i : j + 1])
+            check.append(ch + ch)
+            i = j + 1
+            continue
+        executable.append(ch)
+        check.append(ch)
+        i += 1
+    return "".join(executable).strip(), "".join(check).strip()
 
 
 def _max_rows() -> int:
@@ -229,12 +282,12 @@ class DatabaseManager:
         return json.dumps(schema_map, separators=(",", ":"))
 
     def execute_query(self, sql_query: str) -> list[dict[str, Any]]:
-        cleaned_query = COMMENT_PATTERN.sub(" ", sql_query).strip()
+        cleaned_query, check_text = _scan_sql(sql_query)
 
-        if not ENTRYPOINT_PATTERN.match(cleaned_query):
+        if not ENTRYPOINT_PATTERN.match(check_text):
             raise ClientSafeError(SECURITY_VIOLATION_MESSAGE)
 
-        if MUTATION_PATTERN.search(cleaned_query):
+        if MUTATION_PATTERN.search(check_text):
             raise ClientSafeError(SECURITY_VIOLATION_MESSAGE)
 
         # Execution errors propagate to the tool wrapper, which formats them
